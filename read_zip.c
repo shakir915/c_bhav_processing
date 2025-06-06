@@ -8,15 +8,97 @@
 #include <stdbool.h> // For bool type
 #include <limits.h>  // For LONG_MIN
 
+#define INITIAL_CAPACITY 100 // Initial capacity for dynamic arrays
+
+// Dynamic array for floats
+typedef struct {
+    float* data;
+    size_t count;
+    size_t capacity;
+} FloatArray;
+
+// Dynamic array for long ints
+typedef struct {
+    long int* data;
+    size_t count;
+    size_t capacity;
+} LongArray;
+
+// --- FloatArray Helper Functions ---
+void init_float_array(FloatArray* arr) {
+    arr->data = malloc(INITIAL_CAPACITY * sizeof(float));
+    if (!arr->data) {
+        perror("❌ Failed to allocate memory for FloatArray");
+        // In a real app, might want to exit or have more robust error handling
+        arr->count = 0;
+        arr->capacity = 0;
+        return;
+    }
+    arr->count = 0;
+    arr->capacity = INITIAL_CAPACITY;
+}
+
+void add_to_float_array(FloatArray* arr, float value) {
+    if (arr->capacity == 0) return; // Not initialized
+    if (arr->count >= arr->capacity) {
+        arr->capacity *= 2;
+        float* temp = realloc(arr->data, arr->capacity * sizeof(float));
+        if (!temp) {
+            perror("❌ Failed to reallocate memory for FloatArray");
+            // Data loss or handle error
+            return;
+        }
+        arr->data = temp;
+    }
+    arr->data[arr->count++] = value;
+}
+
+void free_float_array(FloatArray* arr) {
+    free(arr->data);
+    arr->data = NULL;
+    arr->count = 0;
+    arr->capacity = 0;
+}
+
+// --- LongArray Helper Functions ---
+void init_long_array(LongArray* arr) {
+    arr->data = malloc(INITIAL_CAPACITY * sizeof(long int));
+    if (!arr->data) {
+        perror("❌ Failed to allocate memory for LongArray");
+        arr->count = 0;
+        arr->capacity = 0;
+        return;
+    }
+    arr->count = 0;
+    arr->capacity = INITIAL_CAPACITY;
+}
+
+void add_to_long_array(LongArray* arr, long int value) {
+    if (arr->capacity == 0) return; // Not initialized
+    if (arr->count >= arr->capacity) {
+        arr->capacity *= 2;
+        long int* temp = realloc(arr->data, arr->capacity * sizeof(long int));
+        if (!temp) {
+            perror("❌ Failed to reallocate memory for LongArray");
+            // Data loss or handle error
+            return;
+        }
+        arr->data = temp;
+    }
+    arr->data[arr->count++] = value;
+}
+
+void free_long_array(LongArray* arr) {
+    free(arr->data);
+    arr->data = NULL;
+    arr->count = 0;
+    arr->capacity = 0;
+}
 
 
-// Helper function to find, parse, and write a numeric array of LONG INTs for a given key
-// content: The JSON string
-// array_key_prefix: e.g., "\"t\":["
-// fout: File to write long int values to
-// max_val_aggregate: Pointer to update with the maximum value found in this array
+// Helper function to find and parse a numeric array of LONG INTs into a LongArray
 // Returns: 1 if successful and values found, 0 if key not found/empty array, -1 on error
-static int extract_and_process_long_array(const char* content, const char* array_key_prefix, FILE* fout, long int* max_val_aggregate) {
+static int extract_long_array_to_memory(const char* content, const char* array_key_prefix, LongArray* output_array) {
     const char* p = strstr(content, array_key_prefix);
     if (!p) {
         return 0; // Key not found
@@ -25,34 +107,24 @@ static int extract_and_process_long_array(const char* content, const char* array
 
     const char* end_of_array = strchr(p, ']');
     if (!end_of_array) {
-        // fprintf(stderr, "⚠️ Malformed JSON: Closing ']' not found for key '%s'\n", array_key_prefix);
         return -1; // Malformed JSON part
     }
 
-    long int current_array_max = LONG_MIN;
     int values_found_in_array = 0;
     char* current_pos = (char*)p;
 
     while (current_pos < end_of_array && *current_pos != '\0') {
         char* next_val_ptr;
-        long int value = strtol(current_pos, &next_val_ptr, 10); // Base 10
+        long int value = strtol(current_pos, &next_val_ptr, 10);
 
-        if (current_pos == next_val_ptr) { // No conversion or error
+        if (current_pos == next_val_ptr) {
             if (*current_pos == ',' || isspace((unsigned char)*current_pos)) {
                 current_pos++;
                 continue;
             }
             break;
         }
-
-        if (value > current_array_max) {
-            current_array_max = value;
-        }
-
-        if (fout && fwrite(&value, sizeof(long int), 1, fout) != 1) {
-            perror("❌ Failed to write long int value to binary file");
-            return -1; // Write error
-        }
+        add_to_long_array(output_array, value);
         values_found_in_array++;
 
         current_pos = next_val_ptr;
@@ -63,87 +135,53 @@ static int extract_and_process_long_array(const char* content, const char* array
             break;
         }
     }
-
-    if (values_found_in_array > 0) {
-        *max_val_aggregate = current_array_max;
-        return 1; // Success
-    }
-    return 0; // No values processed
+    return values_found_in_array > 0 ? 1 : 0;
 }
 
-
-
-
-
-
-// Helper function to find, parse, and write a numeric array for a given key
-// content: The JSON string
-// array_key_prefix: e.g., "\"h\":["
-// fout: File to write float values to
-// max_val_aggregate: Pointer to update with the maximum value found in this array
+// Helper function to find and parse a numeric array of FLOATs into a FloatArray
 // Returns: 1 if successful and values found, 0 if key not found/empty array, -1 on error
-static int extract_and_process_array(const char* content, const char* array_key_prefix, FILE* fout, float* max_val_aggregate) {
+static int extract_float_array_to_memory(const char* content, const char* array_key_prefix, FloatArray* output_array) {
     const char* p = strstr(content, array_key_prefix);
     if (!p) {
-        // Key not found, not necessarily an error, could be optional data
         return 0;
     }
-    p += strlen(array_key_prefix); // Move past the key and '['
+    p += strlen(array_key_prefix);
 
     const char* end_of_array = strchr(p, ']');
     if (!end_of_array) {
-        // fprintf(stderr, "⚠️ Malformed JSON: Closing ']' not found for key '%s'\n", array_key_prefix);
-        return -1; // Malformed JSON part
+        return -1;
     }
 
-    float current_array_max = -FLT_MAX;
     int values_found_in_array = 0;
-    char* current_pos = (char*)p; // Current position in the numeric data part of the array
+    char* current_pos = (char*)p;
 
     while (current_pos < end_of_array && *current_pos != '\0') {
         char* next_val_ptr;
         float value = strtof(current_pos, &next_val_ptr);
 
-        if (current_pos == next_val_ptr) { // No conversion happened or error
-            // Skip non-numeric characters like commas or whitespace if any, otherwise break
+        if (current_pos == next_val_ptr) {
             if (*current_pos == ',' || isspace((unsigned char)*current_pos)) {
                 current_pos++;
                 continue;
             }
-            break; // Assume end of numbers or malformed section
+            break;
         }
-
-        if (value > current_array_max) {
-            current_array_max = value;
-        }
-
-        if (fout && fwrite(&value, sizeof(float), 1, fout) != 1) {
-            perror("❌ Failed to write value to binary file");
-            return -1; // Write error
-        }
+        add_to_float_array(output_array, value);
         values_found_in_array++;
 
         current_pos = next_val_ptr;
-        // Skip comma and whitespace before next number or end of array
         while (current_pos < end_of_array && (*current_pos == ',' || isspace((unsigned char)*current_pos))) {
             current_pos++;
         }
-        if (current_pos >= end_of_array || *current_pos == ']') { // Reached end of array content or ']'
+        if (current_pos >= end_of_array || *current_pos == ']') {
             break;
         }
     }
-
-    if (values_found_in_array > 0) {
-        *max_val_aggregate = current_array_max;
-        return 1; // Success, values processed
-    }
-    return 0; // No values processed (e.g., empty array or key found but no valid numbers)
+    return values_found_in_array > 0 ? 1 : 0;
 }
 
 
-
-void process_json(const char* content, const char*  filename) {
-    // Define keys: o, h, l, c (floats) first, then t, v (longs)
+void process_json(const char* content, const char* filename) {
     #define NUM_FLOAT_KEYS 4
     #define NUM_LONG_KEYS 2
     #define TOTAL_KEYS (NUM_FLOAT_KEYS + NUM_LONG_KEYS)
@@ -157,99 +195,199 @@ void process_json(const char* content, const char*  filename) {
         "Timestamp", "Volume"                       // Longs
     };
 
-    float max_float_values[NUM_FLOAT_KEYS];
-    long int max_long_values[NUM_LONG_KEYS];
-    bool key_processed_successfully[TOTAL_KEYS];
+    FloatArray float_data_arrays[NUM_FLOAT_KEYS];
+    LongArray long_data_arrays[NUM_LONG_KEYS];
 
-    for (int i = 0; i < NUM_FLOAT_KEYS; ++i) max_float_values[i] = -FLT_MAX;
-    for (int i = 0; i < NUM_LONG_KEYS; ++i) max_long_values[i] = LONG_MIN;
-    for (int i = 0; i < TOTAL_KEYS; ++i) key_processed_successfully[i] = false;
-
-    // Output file name reflects all data types
-    FILE* fout = fopen("ohlctv_values.bin", "ab");
-    if (!fout) {
-        perror("❌ Failed to open ohlctv_values.bin for append");
-        return;
+    for (int i = 0; i < NUM_FLOAT_KEYS; ++i) {
+        init_float_array(&float_data_arrays[i]);
+    }
+    for (int i = 0; i < NUM_LONG_KEYS; ++i) {
+        init_long_array(&long_data_arrays[i]);
     }
 
-    bool any_data_processed_overall = false;
+    bool any_data_extracted_to_memory = false;
+    bool error_occurred = false;
+    size_t expected_count = 0; // Will store the common array size
 
     for (int i = 0; i < TOTAL_KEYS; ++i) {
         int result;
         if (i < NUM_FLOAT_KEYS) { // Processing float keys (o, h, l, c)
-            float current_key_max_float = -FLT_MAX;
-            result = extract_and_process_array(content, keys_prefix[i], fout, &current_key_max_float);
-            if (result == 1) {
-                max_float_values[i] = current_key_max_float;
-            }
+            result = extract_float_array_to_memory(content, keys_prefix[i], &float_data_arrays[i]);
         } else { // Processing long int keys (t, v)
-            long int current_key_max_long = LONG_MIN;
-            // Index for max_long_values is (i - NUM_FLOAT_KEYS)
-            result = extract_and_process_long_array(content, keys_prefix[i], fout, &current_key_max_long);
-            if (result == 1) {
-                max_long_values[i - NUM_FLOAT_KEYS] = current_key_max_long;
-            }
+            result = extract_long_array_to_memory(content, keys_prefix[i], &long_data_arrays[i - NUM_FLOAT_KEYS]);
         }
 
         if (result == 1) {
-            key_processed_successfully[i] = true;
-            any_data_processed_overall = true;
+            any_data_extracted_to_memory = true;
         } else if (result == -1) {
-            fprintf(stderr, "❌ Error processing data for key %s\n", key_names[i]);
-            fclose(fout);
-            return;
+            fprintf(stderr, "❌ Error parsing data for key %s in %s\n", key_names[i], filename);
+            error_occurred = true;
+            break; // Stop processing this JSON if parsing error
         }
     }
 
-    long file_size_bytes = 0;
-    double file_size_mb = 0.0;
-
-    if (any_data_processed_overall) {
-        if (fflush(fout) != 0) {
-            perror("❌ Failed to flush output file");
-        }
-        if (fseek(fout, 0, SEEK_END) == 0) {
-            file_size_bytes = ftell(fout);
-            if (file_size_bytes == -1L) {
-                perror("❌ Failed to get file size (ftell)");
-            } else {
-                file_size_mb = (double)file_size_bytes / (1024.0 * 1024.0);
-            }
-        } else {
-            perror("❌ Failed to seek to end of output file (fseek)");
-        }
+    if (error_occurred) {
+        goto cleanup;
     }
 
-    if (fclose(fout) != 0) {
-        perror("❌ Failed to close output file");
-    }
+    if (any_data_extracted_to_memory) {
+        // Check for consistent array sizes
+        bool first_populated_array_found = false;
+        bool size_mismatch = false;
 
-    if (any_data_processed_overall) {
-       // printf("📈 Processed: ");
-        for (int i = 0; i < TOTAL_KEYS; ++i) {
-            if (key_processed_successfully[i]) {
-                if (i < NUM_FLOAT_KEYS) {
-                    //printf("%s Max: %.2f", key_names[i], max_float_values[i]);
-                } else {
-                   // printf("%s Max: %ld", key_names[i], max_long_values[i - NUM_FLOAT_KEYS]);
+        for (int i = 0; i < NUM_FLOAT_KEYS; ++i) {
+            if (float_data_arrays[i].count > 0) {
+                if (!first_populated_array_found) {
+                    expected_count = float_data_arrays[i].count;
+                    first_populated_array_found = true;
+                } else if (float_data_arrays[i].count != expected_count) {
+                    size_mismatch = true;
+                    break;
                 }
-            } else {
-                printf("%s: (no data)", key_names[i]);
-            }
-            if (i < TOTAL_KEYS - 1) {
-                //printf(" | ");
             }
         }
-        printf(" %s | File size: %.1f MB\n", filename ,file_size_mb);
-    } else {
-        // printf("ℹ️ No o, h, l, c, t, v data found in this JSON content.\n");
+
+        if (!size_mismatch) {
+            for (int i = 0; i < NUM_LONG_KEYS; ++i) {
+                if (long_data_arrays[i].count > 0) {
+                    if (!first_populated_array_found) {
+                        expected_count = long_data_arrays[i].count;
+                        first_populated_array_found = true;
+                    } else if (long_data_arrays[i].count != expected_count) {
+                        size_mismatch = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // If no data was extracted at all, expected_count will be 0, and first_populated_array_found will be false.
+        // In this case, we don't want to write anything for this scrip.
+        if (!first_populated_array_found) { // No data to write
+             any_data_extracted_to_memory = false; // Ensure we skip writing block
+        } else if (size_mismatch) { // Data found, but sizes inconsistent
+             fprintf(stderr, "❌ Error: Data array size mismatch for scrip %s. Expected %zu elements for all populated fields.\n", filename, expected_count);
+             for(int i=0; i<NUM_FLOAT_KEYS; ++i) {
+                 if(float_data_arrays[i].count > 0) fprintf(stderr, "  %s: %zu\n", key_names[i], float_data_arrays[i].count);
+             }
+             for(int i=0; i<NUM_LONG_KEYS; ++i) {
+                 if(long_data_arrays[i].count > 0) fprintf(stderr, "  %s: %zu\n", key_names[NUM_FLOAT_KEYS+i], long_data_arrays[i].count);
+             }
+             error_occurred = true;
+        }
+
+
+        // Extract scrip name and check length
+        char scrip_name[101]; // Max 100 chars + null terminator
+        const char* last_slash = strrchr(filename, '/');
+        const char* base_name_start = last_slash ? last_slash + 1 : filename;
+
+        strncpy(scrip_name, base_name_start, sizeof(scrip_name) -1);
+        scrip_name[sizeof(scrip_name)-1] = '\0'; // Ensure null termination
+
+        char* dot_json = strstr(scrip_name, ".json");
+        if (dot_json) {
+            *dot_json = '\0'; // Truncate .json
+        }
+
+        size_t scrip_name_len = strlen(scrip_name);
+
+        if (scrip_name_len == 0 && any_data_extracted_to_memory) { // Only an error if we intended to write data
+            fprintf(stderr, "❌ Error: Extracted scrip name is empty for %s, but data was found.\n", filename);
+            error_occurred = true;
+        } else if (scrip_name_len > 100) {
+            fprintf(stderr, "❌ Error: Scrip name '%s' (from %s) is too long (%zu > 100).\n", scrip_name, filename, scrip_name_len);
+            error_occurred = true;
+        }
+
+        // Proceed to write only if data was extracted, no parsing errors, no size mismatch, and no scrip name issues
+        if (any_data_extracted_to_memory && !error_occurred) {
+            FILE* fout_bin = fopen("ohlctv_values.bin", "ab");
+            if (!fout_bin) {
+                perror("❌ Failed to open ohlctv_values.bin for append in process_json");
+                error_occurred = true; // Mark error to ensure cleanup, though can't write
+            } else {
+                // 1. Write scrip name length (1 byte)
+                unsigned char name_len_byte = (unsigned char)scrip_name_len;
+                if (fwrite(&name_len_byte, sizeof(unsigned char), 1, fout_bin) != 1) {
+                    perror("❌ Failed to write scrip name length to binary file");
+                    error_occurred = true;
+                }
+
+                // 2. Write scrip name (string)
+                if (!error_occurred) {
+                    if (fwrite(scrip_name, sizeof(char), scrip_name_len, fout_bin) != scrip_name_len) {
+                        perror("❌ Failed to write scrip name to binary file");
+                        error_occurred = true;
+                    }
+                }
+
+                // 3. Write array size (expected_count) as uint32_t
+                if (!error_occurred) {
+                    uint32_t array_size_to_write = (uint32_t)expected_count;
+                    if (fwrite(&array_size_to_write, sizeof(uint32_t), 1, fout_bin) != 1) {
+                        perror("❌ Failed to write array size to binary file");
+                        error_occurred = true;
+                    }
+                }
+
+                // 4. Write float arrays if no error so far
+                if (!error_occurred) {
+                    for (int i = 0; i < NUM_FLOAT_KEYS; ++i) {
+                        if (float_data_arrays[i].count > 0) { // Should always be expected_count if we reach here
+                            if (fwrite(float_data_arrays[i].data, sizeof(float), float_data_arrays[i].count, fout_bin) != float_data_arrays[i].count) {
+                                perror("❌ Failed to write float data to binary file");
+                                error_occurred = true; break;
+                            }
+                        }
+                    }
+                }
+                // 4. Write long arrays if no error so far
+                if (!error_occurred) {
+                    for (int i = 0; i < NUM_LONG_KEYS; ++i) {
+                        if (long_data_arrays[i].count > 0) { // Should always be expected_count
+                            if (fwrite(long_data_arrays[i].data, sizeof(long int), long_data_arrays[i].count, fout_bin) != long_data_arrays[i].count) {
+                                perror("❌ Failed to write long data to binary file");
+                                error_occurred = true; break;
+                            }
+                        }
+                    }
+                }
+
+                long file_size_bytes = 0;
+                double file_size_mb = 0.0;
+
+                if (!error_occurred) {
+                    if (fflush(fout_bin) != 0) {
+                        perror("❌ Failed to flush binary output file");
+                    }
+                    if (fseek(fout_bin, 0, SEEK_END) == 0) {
+                        file_size_bytes = ftell(fout_bin);
+                        if (file_size_bytes == -1L) {
+                            perror("❌ Failed to get binary file size (ftell)");
+                        } else {
+                            file_size_mb = (double)file_size_bytes / (1024.0 * 1024.0);
+                        }
+                    } else {
+                        perror("❌ Failed to seek to end of binary output file (fseek)");
+                    }
+                }
+
+                if (fclose(fout_bin) != 0) {
+                    perror("❌ Failed to close binary output file");
+                }
+                if (!error_occurred) {
+                    printf("Processed: %s (%s) | Appended data (%zu records). Total Binary File size: %.1f MB\n", filename, scrip_name, expected_count, file_size_mb);
+                }
+            }
+        }
     }
+
+cleanup:
+    // Free allocated memory
+    for (int i = 0; i < NUM_FLOAT_KEYS; ++i) free_float_array(&float_data_arrays[i]);
+    for (int i = 0; i < NUM_LONG_KEYS; ++i) free_long_array(&long_data_arrays[i]);
 }
-
-
-
-
-
 
 
 
@@ -267,23 +405,30 @@ void read_zip(const char* zip_path) {
     }
 
     do {
-        char filename[256];
+        char filename_in_zip[256]; // Renamed to avoid conflict with parameter `filename` in process_json
         unz_file_info file_info;
 
-        if (unzGetCurrentFileInfo(zip, &file_info, filename, sizeof(filename), NULL, 0, NULL, 0) == UNZ_OK) {
-            if (strstr(filename, ".json") && !strstr(filename, "__MACOSX/")) {
+        if (unzGetCurrentFileInfo(zip, &file_info, filename_in_zip, sizeof(filename_in_zip), NULL, 0, NULL, 0) == UNZ_OK) {
+            if (strstr(filename_in_zip, ".json") && !strstr(filename_in_zip, "__MACOSX/")) {
                 if (unzOpenCurrentFile(zip) == UNZ_OK) {
                     char *buffer = malloc(file_info.uncompressed_size + 1);
                     if (!buffer) {
-                        printf("❌ Memory allocation failed\n");
+                        printf("❌ Memory allocation failed for %s\n", filename_in_zip);
                         unzCloseCurrentFile(zip);
                         continue;
                     }
 
-                    unzReadCurrentFile(zip, buffer, file_info.uncompressed_size);
+                    int read_size = unzReadCurrentFile(zip, buffer, file_info.uncompressed_size);
+                     if (read_size < 0 || (unsigned int)read_size != file_info.uncompressed_size) { // Check read_size
+                         printf("❌ Error reading file %s from zip. Expected %u, got %d. Error code: %d\n",
+                                filename_in_zip, file_info.uncompressed_size, read_size, read_size < 0 ? read_size : 0);
+                         free(buffer);
+                         unzCloseCurrentFile(zip);
+                         continue;
+                    }
                     buffer[file_info.uncompressed_size] = '\0';
 
-                    process_json(buffer,filename);
+                    process_json(buffer, filename_in_zip); // Pass filename_in_zip
                     free(buffer);
 
                     unzCloseCurrentFile(zip);
@@ -296,19 +441,20 @@ void read_zip(const char* zip_path) {
 }
 
 int main(int argc, char *argv[]) {
-    // Clean/create the output file at the start
-    FILE* fout_init = fopen("ohlctv_values.bin", "wb"); // Updated filename
-    if (!fout_init) {
-        perror("❌ Failed to initialize output file ohlctv_values.bin");
+    // Clean/create the binary output file at the start of the program
+    FILE* fout_bin_init = fopen("ohlctv_values.bin", "wb");
+    if (!fout_bin_init) {
+        perror("❌ Failed to initialize binary output file ohlctv_values.bin");
         return 1;
     }
-    fclose(fout_init);
+    fclose(fout_bin_init);
 
-    clock_t start_time = clock();  // ⏱️ Start timer
+    clock_t start_time = clock();
 
+    // Ensure this path is correct for your system
     read_zip("/Users/shakir/BhavAppData/DATA/TEST/1D_ALL_JSON_MoneyControl.zip");
 
-    clock_t end_time = clock();    // ⏱️ End timer
+    clock_t end_time = clock();
 
     double time_spent = (double)(end_time - start_time) / CLOCKS_PER_SEC;
     printf("🕒 Total time: %.3f seconds\n", time_spent);
