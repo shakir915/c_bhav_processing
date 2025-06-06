@@ -7,8 +7,10 @@
 #include <ctype.h>   // For isspace
 #include <stdbool.h> // For bool type
 #include <limits.h>  // For LONG_MIN
+#include <stdint.h> // For uint32_t
 
 #define INITIAL_CAPACITY 100 // Initial capacity for dynamic arrays
+#define LOG_ENABLED false
 
 // Dynamic array for floats
 typedef struct {
@@ -376,7 +378,7 @@ void process_json(const char* content, const char* filename) {
                 if (fclose(fout_bin) != 0) {
                     perror("❌ Failed to close binary output file");
                 }
-                if (!error_occurred) {
+                if (!error_occurred&&LOG_ENABLED) {
                     printf("Processed: %s (%s) | Appended data (%zu records). Total Binary File size: %.1f MB\n", filename, scrip_name, expected_count, file_size_mb);
                 }
             }
@@ -440,6 +442,126 @@ void read_zip(const char* zip_path) {
     unzClose(zip);
 }
 
+
+
+// Function to read back and print the data from the binary file
+void read_and_print_binary_data(const char* bin_filepath) {
+    FILE* fin = fopen(bin_filepath, "rb");
+    if (!fin) {
+        perror("❌ Failed to open binary file for reading");
+        return;
+    }
+
+    if (LOG_ENABLED)
+    printf("\n--- Reading and Printing Data from %s ---\n", bin_filepath);
+
+    while (true) {
+        unsigned char scrip_name_len_byte;
+        size_t items_read;
+
+        // 1. Read scrip name length
+        items_read = fread(&scrip_name_len_byte, sizeof(unsigned char), 1, fin);
+        if (items_read != 1) {
+            if (feof(fin)) {
+                // printf("ℹ️ End of file reached.\n");
+                break; // Expected EOF
+            }
+            perror("❌ Failed to read scrip name length");
+            break;
+        }
+        uint8_t scrip_name_len = scrip_name_len_byte; // Cast to uint8_t for clarity
+
+        // 2. Read scrip name
+        char scrip_name[101]; // Max 100 chars + null terminator
+        if (scrip_name_len > 100) {
+            fprintf(stderr, "❌ Error: Scrip name length %u in file is too large (max 100).\n", scrip_name_len);
+            // Attempt to skip the rest of this record, though file might be corrupted
+            // This is a simplified error handling for this case.
+            break;
+        }
+        items_read = fread(scrip_name, sizeof(char), scrip_name_len, fin);
+        if (items_read != scrip_name_len) {
+            perror("❌ Failed to read scrip name");
+            break;
+        }
+        scrip_name[scrip_name_len] = '\0'; // Null-terminate the scrip name
+
+        // 3. Read array size
+        uint32_t array_size;
+        items_read = fread(&array_size, sizeof(uint32_t), 1, fin);
+        if (items_read != 1) {
+            perror("❌ Failed to read array size");
+            break;
+        }
+
+        if (array_size == 0 && scrip_name_len > 0) { // Scrip name present but no data
+            printf("Symbol: %s | No data records (array size is 0).\n", scrip_name);
+            continue;
+        }
+         if (array_size == 0 && scrip_name_len == 0) { // Should not happen if writer is correct
+            fprintf(stderr, "Warning: Encountered zero length scrip name and zero array size.\n");
+            continue;
+        }
+
+
+        if (LOG_ENABLED)
+        printf("\nSymbol: %s (Array Size: %u)\n", scrip_name, array_size);
+
+        // 4. Allocate memory and read o, h, l, c, t, v data
+        float* o_data = malloc(array_size * sizeof(float));
+        float* h_data = malloc(array_size * sizeof(float));
+        float* l_data = malloc(array_size * sizeof(float));
+        float* c_data = malloc(array_size * sizeof(float));
+        long int* t_data = malloc(array_size * sizeof(long int));
+        long int* v_data = malloc(array_size * sizeof(long int));
+
+        bool read_error = false;
+        if (!o_data || !h_data || !l_data || !c_data || !t_data || !v_data) {
+            perror("❌ Memory allocation failed for reading data arrays");
+            read_error = true;
+        }
+
+        if (!read_error) {
+            if (fread(o_data, sizeof(float), array_size, fin) != array_size) read_error = true;
+            if (!read_error && fread(h_data, sizeof(float), array_size, fin) != array_size) read_error = true;
+            if (!read_error && fread(l_data, sizeof(float), array_size, fin) != array_size) read_error = true;
+            if (!read_error && fread(c_data, sizeof(float), array_size, fin) != array_size) read_error = true;
+            if (!read_error && fread(t_data, sizeof(long int), array_size, fin) != array_size) read_error = true;
+            if (!read_error && fread(v_data, sizeof(long int), array_size, fin) != array_size) read_error = true;
+        }
+
+        if (read_error) {
+            fprintf(stderr, "❌ Error reading OHLCVT data for %s.\n", scrip_name);
+            // Free any partially allocated buffers
+            free(o_data); free(h_data); free(l_data); free(c_data);
+            free(t_data); free(v_data);
+            break; // Stop processing further
+        }
+
+        // Print the data (example: print first few and last few if many)
+        if (LOG_ENABLED) {
+            printf("  O: "); for (uint32_t i = 0; i < array_size && i < 5; ++i) printf("%.2f ", o_data[i]); if (array_size > 5) printf("..."); printf("\n");
+            printf("  H: "); for (uint32_t i = 0; i < array_size && i < 5; ++i) printf("%.2f ", h_data[i]); if (array_size > 5) printf("..."); printf("\n");
+            printf("  L: "); for (uint32_t i = 0; i < array_size && i < 5; ++i) printf("%.2f ", l_data[i]); if (array_size > 5) printf("..."); printf("\n");
+            printf("  C: "); for (uint32_t i = 0; i < array_size && i < 5; ++i) printf("%.2f ", c_data[i]); if (array_size > 5) printf("..."); printf("\n");
+            printf("  T: "); for (uint32_t i = 0; i < array_size && i < 5; ++i) printf("%ld ",  t_data[i]); if (array_size > 5) printf("..."); printf("\n");
+            printf("  V: "); for (uint32_t i = 0; i < array_size && i < 5; ++i) printf("%ld ",  v_data[i]); if (array_size > 5) printf("..."); printf("\n");
+        }
+        free(o_data);
+        free(h_data);
+        free(l_data);
+        free(c_data);
+        free(t_data);
+        free(v_data);
+    }
+
+    if (fclose(fin) != 0) {
+        perror("❌ Failed to close binary file after reading");
+    }
+    if (LOG_ENABLED)
+    printf("\n--- Finished reading %s ---\n", bin_filepath);
+}
+
 int main(int argc, char *argv[]) {
     // Clean/create the binary output file at the start of the program
     FILE* fout_bin_init = fopen("ohlctv_values.bin", "wb");
@@ -457,7 +579,16 @@ int main(int argc, char *argv[]) {
     clock_t end_time = clock();
 
     double time_spent = (double)(end_time - start_time) / CLOCKS_PER_SEC;
-    printf("🕒 Total time: %.3f seconds\n", time_spent);
+    printf("🕒 Total time for writing: %.3f seconds\n", time_spent);
+
+    // Read and print the data from the binary file
+     start_time = clock();
+    read_and_print_binary_data("ohlctv_values.bin");
+    end_time = clock();
+    time_spent = (double)(end_time - start_time) / CLOCKS_PER_SEC;
+    printf("🕒 Total time for writing: %.3f seconds\n", time_spent);
+
 
     return 0;
 }
+
