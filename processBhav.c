@@ -476,12 +476,95 @@ void read_zip(const char *zip_path) {
 }
 
 
-// Function to read back and print the data from the binary file
-void read_and_print_binary_data(const char *bin_filepath) {
+// New struct to hold the results
+typedef struct {
+    char **scrip_names;         // Dynamically allocated array of scrip names
+    size_t *scrip_candle_counts; // Array of candle counts for each scrip
+    size_t num_scrips;          // Count of scrips successfully read
+    size_t scrip_data_capacity; // Current capacity of scrip_names and scrip_candle_counts arrays
+    bool error_occurred;        // Flag to indicate if an error happened during processing
+} BinaryDataSummary;
+
+// Helper to initialize the summary struct
+void init_binary_data_summary(BinaryDataSummary *summary) {
+    summary->scrip_names = NULL;
+    summary->scrip_candle_counts = NULL;
+    summary->num_scrips = 0;
+    summary->scrip_data_capacity = 0;
+    summary->error_occurred = false;
+}
+
+// Helper to add a scrip name and its candle count to the summary
+// Returns true on success, false on memory allocation failure
+bool add_scrip_to_summary(BinaryDataSummary *summary, const char *scrip_name, uint32_t candle_count) {
+    if (summary->num_scrips >= summary->scrip_data_capacity) {
+        size_t new_capacity = (summary->scrip_data_capacity == 0) ? 10 : summary->scrip_data_capacity * 2;
+
+        char **temp_names = realloc(summary->scrip_names, new_capacity * sizeof(char *));
+        if (!temp_names) {
+            perror("❌ Failed to reallocate memory for scrip names in summary");
+            summary->error_occurred = true;
+            return false;
+        }
+        summary->scrip_names = temp_names;
+
+        size_t *temp_counts = realloc(summary->scrip_candle_counts, new_capacity * sizeof(size_t));
+        if (!temp_counts) {
+            perror("❌ Failed to reallocate memory for scrip candle counts in summary");
+            // scrip_names was already reallocated. To prevent memory leak of temp_names if it was a new block,
+            // and to keep state consistent, ideally we'd free temp_names if it's different from original summary->scrip_names
+            // or revert summary->scrip_names. However, for simplicity, just mark error.
+            // The original summary->scrip_names is now potentially lost if realloc moved it and this fails.
+            // A safer approach would be to realloc to new pointers first, then assign to summary struct members on full success.
+            summary->error_occurred = true;
+            return false; // Note: if scrip_names realloc moved memory, old pointer is invalid.
+        }
+        summary->scrip_candle_counts = temp_counts;
+        summary->scrip_data_capacity = new_capacity;
+    }
+
+    summary->scrip_names[summary->num_scrips] = strdup(scrip_name);
+    if (!summary->scrip_names[summary->num_scrips]) {
+        perror("❌ Failed to duplicate scrip name for summary");
+        summary->error_occurred = true;
+        // If strdup fails, the allocated space in scrip_candle_counts for this entry is unused but will be freed later.
+        return false;
+    }
+    summary->scrip_candle_counts[summary->num_scrips] = (size_t)candle_count; // Store the candle count
+    summary->num_scrips++;
+    return true;
+}
+
+// Helper to free memory allocated within the summary struct
+void free_binary_data_summary(BinaryDataSummary *summary) {
+    if (summary->scrip_names) {
+        for (size_t i = 0; i < summary->num_scrips; ++i) {
+            free(summary->scrip_names[i]); // scrip_names[i] can be NULL if strdup failed but num_scrips was not incremented
+                                          // However, add_scrip_to_summary returns false before incrementing num_scrips on strdup failure.
+        }
+        free(summary->scrip_names);
+        summary->scrip_names = NULL;
+    }
+    if (summary->scrip_candle_counts) {
+        free(summary->scrip_candle_counts);
+        summary->scrip_candle_counts = NULL;
+    }
+    // Reset to initial state (optional, but good practice if struct is reused)
+    init_binary_data_summary(summary);
+}
+
+
+// Function to read back data from the binary file and return statistics.
+// The detailed printing within the loop is still controlled by LOG_ENABLED.
+BinaryDataSummary read_and_print_binary_data(const char *bin_filepath) {
+    BinaryDataSummary summary;
+    init_binary_data_summary(&summary);
+
     FILE *fin = fopen(bin_filepath, "rb");
     if (!fin) {
         perror("❌ Failed to open binary file for reading");
-        return;
+        summary.error_occurred = true;
+        return summary; // Return summary with error flag set
     }
 
     if (LOG_ENABLED)
@@ -495,286 +578,137 @@ void read_and_print_binary_data(const char *bin_filepath) {
         items_read = fread(&scrip_name_len_byte, sizeof(unsigned char), 1, fin);
         if (items_read != 1) {
             if (feof(fin)) {
-                // printf("ℹ️ End of file reached.\n");
                 break; // Expected EOF
             }
             perror("❌ Failed to read scrip name length");
-            break;
-        }
-        uint8_t scrip_name_len = scrip_name_len_byte; // Cast to uint8_t for clarity
-
-        // 2. Read scrip name
-        char scrip_name[101]; // Max 100 chars + null terminator
-        if (scrip_name_len > 100) {
-            fprintf(stderr, "❌ Error: Scrip name length %u in file is too large (max 100).\n", scrip_name_len);
-            // Attempt to skip the rest of this record, though file might be corrupted
-            // This is a simplified error handling for this case.
-            break;
-        }
-        items_read = fread(scrip_name, sizeof(char), scrip_name_len, fin);
-        if (items_read != scrip_name_len) {
-            perror("❌ Failed to read scrip name");
-            break;
-        }
-        scrip_name[scrip_name_len] = '\0'; // Null-terminate the scrip name
-
-        // 3. Read array size
-        uint32_t array_size;
-        items_read = fread(&array_size, sizeof(uint32_t), 1, fin);
-        if (items_read != 1) {
-            perror("❌ Failed to read array size");
-            break;
-        }
-
-        if (array_size == 0 && scrip_name_len > 0) {
-            // Scrip name present but no data
-            printf("Symbol: %s | No data records (array size is 0).\n", scrip_name);
-            continue;
-        }
-        if (array_size == 0 && scrip_name_len == 0) {
-            // Should not happen if writer is correct
-            fprintf(stderr, "Warning: Encountered zero length scrip name and zero array size.\n");
-            continue;
-        }
-
-
-        if (LOG_ENABLED)
-            printf("\nSymbol: %s (Array Size: %u)\n", scrip_name, array_size);
-
-        // 4. Allocate memory and read o, h, l, c, t, v data
-        float *o_data = malloc(array_size * sizeof(float));
-        float *h_data = malloc(array_size * sizeof(float));
-        float *l_data = malloc(array_size * sizeof(float));
-        float *c_data = malloc(array_size * sizeof(float));
-        long int *t_data = malloc(array_size * sizeof(long int));
-        long int *v_data = malloc(array_size * sizeof(long int));
-
-        bool read_error = false;
-        if (!o_data || !h_data || !l_data || !c_data || !t_data || !v_data) {
-            perror("❌ Memory allocation failed for reading data arrays");
-            read_error = true;
-        }
-
-        if (!read_error) {
-            if (fread(o_data, sizeof(float), array_size, fin) != array_size) read_error = true;
-            if (!read_error && fread(h_data, sizeof(float), array_size, fin) != array_size) read_error = true;
-            if (!read_error && fread(l_data, sizeof(float), array_size, fin) != array_size) read_error = true;
-            if (!read_error && fread(c_data, sizeof(float), array_size, fin) != array_size) read_error = true;
-            if (!read_error && fread(t_data, sizeof(long int), array_size, fin) != array_size) read_error = true;
-            if (!read_error && fread(v_data, sizeof(long int), array_size, fin) != array_size) read_error = true;
-        }
-
-        if (read_error) {
-            fprintf(stderr, "❌ Error reading OHLCVT data for %s.\n", scrip_name);
-            // Free any partially allocated buffers
-            free(o_data);
-            free(h_data);
-            free(l_data);
-            free(c_data);
-            free(t_data);
-            free(v_data);
-            break; // Stop processing further
-        }
-
-        // Print the data (example: print first few and last few if many)
-        if (LOG_ENABLED) {
-            printf("  O: ");
-            for (uint32_t i = 0; i < array_size && i < 5; ++i) printf("%.2f ", o_data[i]);
-            if (array_size > 5) printf("...");
-            printf("\n");
-            printf("  H: ");
-            for (uint32_t i = 0; i < array_size && i < 5; ++i) printf("%.2f ", h_data[i]);
-            if (array_size > 5) printf("...");
-            printf("\n");
-            printf("  L: ");
-            for (uint32_t i = 0; i < array_size && i < 5; ++i) printf("%.2f ", l_data[i]);
-            if (array_size > 5) printf("...");
-            printf("\n");
-            printf("  C: ");
-            for (uint32_t i = 0; i < array_size && i < 5; ++i) printf("%.2f ", c_data[i]);
-            if (array_size > 5) printf("...");
-            printf("\n");
-            printf("  T: ");
-            for (uint32_t i = 0; i < array_size && i < 5; ++i) printf("%ld ", t_data[i]);
-            if (array_size > 5) printf("...");
-            printf("\n");
-            printf("  V: ");
-            for (uint32_t i = 0; i < array_size && i < 5; ++i) printf("%ld ", v_data[i]);
-            if (array_size > 5) printf("...");
-            printf("\n");
-        }
-        free(o_data);
-        free(h_data);
-        free(l_data);
-        free(c_data);
-        free(t_data);
-        free(v_data);
-    }
-
-    if (fclose(fin) != 0) {
-        perror("❌ Failed to close binary file after reading");
-    }
-    if (LOG_ENABLED)
-        printf("\n--- Finished reading %s ---\n", bin_filepath);
-}
-
-
-
-
-// Structure to hold a list of symbol strings
-typedef struct {
-    char **symbols;
-    size_t count;
-    size_t capacity;
-} SymbolList;
-
-// Helper functions for SymbolList
-void init_symbol_list(SymbolList *list) {
-    list->symbols = malloc(INITIAL_CAPACITY * sizeof(char *));
-    if (!list->symbols) {
-        perror("❌ Failed to allocate memory for SymbolList");
-        list->count = 0;
-        list->capacity = 0;
-        return;
-    }
-    list->count = 0;
-    list->capacity = INITIAL_CAPACITY;
-}
-
-void add_to_symbol_list(SymbolList *list, const char *symbol) {
-    if (list->capacity == 0) return; // Not initialized
-    if (list->count >= list->capacity) {
-        list->capacity *= 2;
-        char **temp = realloc(list->symbols, list->capacity * sizeof(char *));
-        if (!temp) {
-            perror("❌ Failed to reallocate memory for SymbolList");
-            return; // Symbol not added
-        }
-        list->symbols = temp;
-    }
-    list->symbols[list->count] = strdup(symbol); // Duplicate the string
-    if (!list->symbols[list->count]) {
-        perror("❌ Failed to duplicate symbol string");
-        return; // Symbol not added
-    }
-    list->count++;
-}
-
-void free_symbol_list(SymbolList *list) {
-    if (list->symbols) {
-        for (size_t i = 0; i < list->count; ++i) {
-            free(list->symbols[i]); // Free each duplicated string
-        }
-        free(list->symbols);
-    }
-    list->symbols = NULL;
-    list->count = 0;
-    list->capacity = 0;
-}
-
-
-
-// Function to extract all symbols from the binary file
-SymbolList extract_all_symbols_from_binary(const char *bin_filepath) {
-    SymbolList sl;
-    init_symbol_list(&sl);
-
-    FILE *fin = fopen(bin_filepath, "rb");
-    if (!fin) {
-        perror("❌ Failed to open binary file for reading symbols");
-        return sl; // Return empty list
-    }
-
-    if (LOG_ENABLED)
-        printf("\n--- Extracting Symbols from %s ---\n", bin_filepath);
-
-    while (true) {
-        unsigned char scrip_name_len_byte;
-        size_t items_read;
-
-        // 1. Read scrip name length
-        items_read = fread(&scrip_name_len_byte, sizeof(unsigned char), 1, fin);
-        if (items_read != 1) {
-            if (feof(fin)) break; // Expected EOF
-            perror("❌ Failed to read scrip name length (extract_symbols)");
+            summary.error_occurred = true;
             break;
         }
         uint8_t scrip_name_len = scrip_name_len_byte;
 
         // 2. Read scrip name
-        char scrip_name_buffer[101]; // Max 100 chars + null terminator
+        char scrip_name[101]; // Max 100 chars + null terminator
         if (scrip_name_len > 100) {
-            fprintf(stderr, "❌ Error: Scrip name length %u in file is too large (max 100) (extract_symbols).\n", scrip_name_len);
-            // Attempt to recover or break. For now, break.
+            fprintf(stderr, "❌ Error: Scrip name length %u in file is too large (max 100).\n", scrip_name_len);
+            summary.error_occurred = true;
             break;
         }
-        if (scrip_name_len > 0) { // Only read if length is positive
-            items_read = fread(scrip_name_buffer, sizeof(char), scrip_name_len, fin);
-            if (items_read != scrip_name_len) {
-                perror("❌ Failed to read scrip name (extract_symbols)");
-                break;
-            }
-            scrip_name_buffer[scrip_name_len] = '\0'; // Null-terminate
-            add_to_symbol_list(&sl, scrip_name_buffer);
-        } else if (scrip_name_len == 0) {
-             // Potentially an empty scrip record, or end of meaningful data.
-             // We need to read array_size to know if we should continue or if it's an error.
+        items_read = fread(scrip_name, sizeof(char), scrip_name_len, fin);
+        if (items_read != scrip_name_len) {
+            perror("❌ Failed to read scrip name");
+            summary.error_occurred = true;
+            break;
         }
+        scrip_name[scrip_name_len] = '\0';
 
-
-        // 3. Read array size to know how much data to skip
-        uint32_t array_size;
+        // 3. Read array size (candle count for this scrip)
+        uint32_t array_size; // This is the candle count for the current scrip
         items_read = fread(&array_size, sizeof(uint32_t), 1, fin);
         if (items_read != 1) {
-            if (feof(fin) && scrip_name_len == 0) { // If we read 0 len scrip and then EOF, it's fine.
-                 break;
-            }
-            perror("❌ Failed to read array size (extract_symbols)");
+            perror("❌ Failed to read array size");
+            summary.error_occurred = true;
             break;
         }
 
-        if (scrip_name_len == 0 && array_size == 0 && feof(fin)) {
-            // This could be a padding or an empty record at the end.
-            break;
-        }
-
-
-        // 4. Skip OHLCVT data
-        long data_block_size = 0;
-        if (array_size > 0) {
-            // Size of float data: NUM_FLOAT_KEYS * array_size * sizeof(float)
-            // Size of long data: NUM_LONG_KEYS * array_size * sizeof(long int)
-            // Note: NUM_FLOAT_KEYS and NUM_LONG_KEYS are defined in process_json.
-            // For robustness, let's use the constants directly or pass them.
-            // Assuming they are 4 and 2 respectively as per process_json.
-            data_block_size = (long)array_size * (4 * sizeof(float) + 2 * sizeof(long int));
-        }
-
-        if (data_block_size > 0) {
-            if (fseek(fin, data_block_size, SEEK_CUR) != 0) {
-                perror("❌ Failed to seek past data block (extract_symbols)");
+        // Add to summary if scrip name is present
+        if (scrip_name_len > 0) {
+            if (!add_scrip_to_summary(&summary, scrip_name, array_size)) { // Pass array_size as candle_count
+                // Error already handled by add_scrip_to_summary
                 break;
             }
-        } else if (array_size > 0 && data_block_size == 0) {
-            // This case implies array_size > 0 but calculated block size is 0, which is an issue.
-            // However, our calculation of data_block_size should prevent this if array_size > 0.
         }
-        // If array_size is 0, data_block_size will be 0, and no seek is needed.
-    }
+
+        if (array_size == 0) {
+            if (scrip_name_len > 0 && LOG_ENABLED) {
+                 printf("Symbol: %s | No data records (array size is 0).\n", scrip_name);
+            } else if (scrip_name_len == 0 && LOG_ENABLED) {
+                 fprintf(stderr, "Warning: Encountered zero length scrip name and zero array size.\n");
+            }
+            continue; // Move to next record
+        }
+
+        if (LOG_ENABLED) {
+            printf("\nSymbol: %s (Array Size/Candle Count: %u)\n", scrip_name, array_size);
+        }
+
+        // 4. Read or skip o, h, l, c, t, v data
+        if (LOG_ENABLED) {
+            float *o_data = malloc(array_size * sizeof(float));
+            float *h_data = malloc(array_size * sizeof(float));
+            float *l_data = malloc(array_size * sizeof(float));
+            float *c_data = malloc(array_size * sizeof(float));
+            long int *t_data = malloc(array_size * sizeof(long int));
+            long int *v_data = malloc(array_size * sizeof(long int));
+
+            bool read_error_for_current_scrip = false;
+            if (!o_data || !h_data || !l_data || !c_data || !t_data || !v_data) {
+                perror("❌ Memory allocation failed for reading data arrays");
+                read_error_for_current_scrip = true;
+                summary.error_occurred = true;
+            }
+
+            if (!read_error_for_current_scrip) {
+                if (fread(o_data, sizeof(float), array_size, fin) != array_size) read_error_for_current_scrip = true;
+                if (!read_error_for_current_scrip && fread(h_data, sizeof(float), array_size, fin) != array_size) read_error_for_current_scrip = true;
+                if (!read_error_for_current_scrip && fread(l_data, sizeof(float), array_size, fin) != array_size) read_error_for_current_scrip = true;
+                if (!read_error_for_current_scrip && fread(c_data, sizeof(float), array_size, fin) != array_size) read_error_for_current_scrip = true;
+                if (!read_error_for_current_scrip && fread(t_data, sizeof(long int), array_size, fin) != array_size) read_error_for_current_scrip = true;
+                if (!read_error_for_current_scrip && fread(v_data, sizeof(long int), array_size, fin) != array_size) read_error_for_current_scrip = true;
+            }
+
+            if (read_error_for_current_scrip) {
+                fprintf(stderr, "❌ Error reading OHLCVT data for %s.\n", scrip_name);
+                summary.error_occurred = true;
+                // Free any partially allocated buffers if some mallocs succeeded before one failed
+                free(o_data); free(h_data); free(l_data); free(c_data); free(t_data); free(v_data);
+                break;
+            }
+
+            printf("  O: "); for (uint32_t i = 0; i < array_size && i < 5; ++i) printf("%.2f ", o_data[i]); if (array_size > 5) printf("..."); printf("\n");
+            printf("  H: "); for (uint32_t i = 0; i < array_size && i < 5; ++i) printf("%.2f ", h_data[i]); if (array_size > 5) printf("..."); printf("\n");
+            printf("  L: "); for (uint32_t i = 0; i < array_size && i < 5; ++i) printf("%.2f ", l_data[i]); if (array_size > 5) printf("..."); printf("\n");
+            printf("  C: "); for (uint32_t i = 0; i < array_size && i < 5; ++i) printf("%.2f ", c_data[i]); if (array_size > 5) printf("..."); printf("\n");
+            printf("  T: "); for (uint32_t i = 0; i < array_size && i < 5; ++i) printf("%ld ", t_data[i]); if (array_size > 5) printf("..."); printf("\n");
+            printf("  V: "); for (uint32_t i = 0; i < array_size && i < 5; ++i) printf("%ld ", v_data[i]); if (array_size > 5) printf("..."); printf("\n");
+
+            free(o_data); free(h_data); free(l_data); free(c_data); free(t_data); free(v_data);
+        } else {
+            // If LOG_ENABLED is false, skip reading the actual data arrays by seeking past them
+            long data_block_size = (long)array_size * (4 * sizeof(float) + 2 * sizeof(long int));
+            if (fseek(fin, data_block_size, SEEK_CUR) != 0) {
+                perror("❌ Failed to seek past data block");
+                summary.error_occurred = true;
+                break;
+            }
+        }
+    } // end while(true)
 
     if (fclose(fin) != 0) {
-        perror("❌ Failed to close binary file after extracting symbols");
+        perror("❌ Failed to close binary file after reading");
+        summary.error_occurred = true;
     }
-    if (LOG_ENABLED)
-        printf("--- Finished extracting %zu symbols ---\n", sl.count);
-    return sl;
+
+    if (LOG_ENABLED) {
+        if (summary.error_occurred) {
+             printf("\n--- Finished reading %s with errors ---\n", bin_filepath);
+        } else {
+             printf("\n--- Finished reading %s ---\n", bin_filepath);
+        }
+    }
+
+    FILE *fout_bin2_init = fopen("ohlctv_values2.bin", "wb");
+    if (!fout_bin2_init) {
+
+    }
+    summary.num_scrips;
+
+    return summary;
 }
 
+
 int main(int argc, char *argv[]) {
-    // Initialize lastTime at the beginning of main
     lastTime = clock();
 
-    // Clean/create the binary output file at the start of the program
     FILE *fout_bin_init = fopen("ohlctv_values.bin", "wb");
     if (!fout_bin_init) {
         perror("❌ Failed to initialize binary output file ohlctv_values.bin");
@@ -782,26 +716,34 @@ int main(int argc, char *argv[]) {
     }
     fclose(fout_bin_init);
 
-
+    // Ensure this path is correct for your system
     read_zip("/Users/shakir/BhavAppData/DATA/TEST/1D_ALL_JSON_MoneyControl.zip");
     printTimeSpent("Total time for writing");
 
-    // Read and print the data from the binary file (optional, can be commented out)
-    // read_and_print_binary_data("ohlctv_values.bin");
-    // printTimeSpent("Read and Print OHLCVT Data Time");
+    // Call the modified function and get the summary
+    BinaryDataSummary summary = read_and_print_binary_data("ohlctv_values.bin");
 
-    // Extract and print all symbols
-    SymbolList symbols = extract_all_symbols_from_binary("ohlctv_values.bin");
-    printTimeSpent("Extract Symbols Time");
-    if (LOG_ENABLED) {
-        printf("\n--- Extracted Symbols (%zu) ---\n", symbols.count);
-        for (size_t i = 0; i < symbols.count; ++i) {
-            printf("%s\n", symbols.symbols[i]);
+    // Print the summary information
+    printf("\n--- Binary Data Read Summary ---\n");
+    if (summary.error_occurred) {
+        printf("Note: An error occurred during reading or processing the binary file. Summary might be partial.\n");
+    }
+    printf("Number of scrips processed: %zu\n", summary.num_scrips);
+
+    if (summary.num_scrips > 0) {
+        printf("Scrip Details (Name | Candle Count):\n");
+        for (size_t i = 0; i < summary.num_scrips; ++i) {
+            // Ensure scrip_names[i] and scrip_candle_counts[i] are valid before printing
+            if (summary.scrip_names[i]) { // Should always be true if num_scrips > 0 and no prior corruption
+                 printf("  - %s | %zu candles\n", summary.scrip_names[i], summary.scrip_candle_counts[i]);
+            }
         }
+    } else {
+        printf("Scrip Details: (No scrips found or read successfully)\n");
     }
 
-    free_symbol_list(&symbols);
-
+    // Free the memory allocated for the summary's scrip names and candle counts
+    free_binary_data_summary(&summary);
 
     return 0;
 }
